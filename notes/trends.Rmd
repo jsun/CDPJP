@@ -1,0 +1,713 @@
+---
+title: '病害・虫害発生傾向'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float:
+            collapsed: false
+        number_sections: true
+        df_print: paged
+date: '`r Sys.Date()`'
+author: 'jsun'
+---
+
+
+# 解析環境
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(stringi)
+library(knitr)
+library(ggsci)
+library(ggvenn)
+PROJECT_DPATH <- '~/projects/jp_pdpdb'
+PDPDB_RDATA <- file.path(PROJECT_DPATH, 'data/PDPDB.RData')
+TRENDS_RDATA <- file.path(PROJECT_DPATH, 'data/TRENDS.RData')
+if (file.exists(PDPDB_RDATA)) {
+    load(PDPDB_RDATA)
+} else {
+    stop('Run `overview.Rmd` to create `PDPDB_RDATA` first')
+}
+OVERWRITE <- FALSE
+if (file.exists(TRENDS_RDATA) && (!OVERWRITE)) load(TRENDS_RDATA)
+```
+
+
+# 傾向調査
+
+
+## 傾向調査関数
+
+傾向調査を行う関数を用意する。
+
+```{r trend_investigation}
+# count_valid_records_item
+#
+# Count number of valid records (non-NA records) for each crop-disease combination.
+count_valid_records_item <- function(x) {
+    .crops <- .items <- .n <- NULL
+    for (i in dimnames(x)[[1]]) {
+        for (j in dimnames(x)[[2]]) {
+            .crops <- c(.crops, i)
+            .items <- c(.items, j)
+            .n <- c(.n, sum(!is.na(x[i, j, , ])))
+        }
+    }
+    stats <- data.frame(crop = .crops, item = .items, n_records = .n) %>%
+        as_tibble %>%
+        dplyr::filter(n_records > 0) %>%
+        dplyr::arrange(desc(n_records))
+    item_labels <- stats %>%
+                        group_by(item) %>%
+                        summarise(n = n()) %>%
+                        arrange(desc(n)) %>%
+                        select(item) %>%
+                        unlist(use.names = FALSE)
+    crop_labels <- stats %>%
+                        group_by(crop) %>%
+                        summarise(n = n()) %>%
+                        arrange(desc(n)) %>%
+                        select(crop) %>%
+                        unlist(use.names = FALSE)
+    stats <- stats %>%
+        mutate(crop = factor(crop, levels = crop_labels),
+               item = factor(item, levels = item_labels))
+    stats_fig <- ggplot(stats, aes(x = n_records)) +
+        geom_histogram() +
+        scale_x_continuous(trans = 'log10') +
+        xlab('log10(n_records)')
+    
+    list(stats = stats, fig = stats_fig)
+}
+```
+
+
+
+## 作物害虫寄生率・作物病害発病率・作物虫害被害率の概要
+
+各調査項目において「作物-病害」の組み合わせで、どのぐらいの有効データがあるのかを確認する。
+
+```{r trend_investigation_obj}
+if (!exists('pest_parasitism')) {
+    pest_parasitism <- melt2array_by_invest(pdpdb, key = 'survey', val = '作物害虫寄生率')
+    disease_damage <- melt2array_by_invest(pdpdb, key = 'survey', val = '作物病害発病率')
+    pest_damage <- melt2array_by_invest(pdpdb, key = 'survey', val = '作物虫害被害率')
+    save(list = ls(), file = TRENDS_RDATA)
+}
+
+pest_parasitism_stats <- count_valid_records_item(pest_parasitism)
+disease_damage_stats <- count_valid_records_item(disease_damage)
+pest_damage_stats <- count_valid_records_item(pest_damage)
+```
+
+
+### 作物害虫寄生率
+
+作物害虫寄生率の有効調査数（記録値が NA でないもの）の分布。
+このうち、1 件以上、10 件以上、100 件以上、1000 件以上の有効調査数をもつ作物-病虫害の組み合わせはそれぞれ、
+`r sum(pest_parasitism_stats$stats$n_records >= 1)`,
+`r sum(pest_parasitism_stats$stats$n_records >= 10)`,
+`r sum(pest_parasitism_stats$stats$n_records >= 100)`,
+`r sum(pest_parasitism_stats$stats$n_records >= 1000)` 通りである。
+
+
+```{r}
+pest_parasitism_stats$stats
+pest_parasitism_stats$fig
+```
+
+### 作物病害発病率
+
+1 件以上、10 件以上、100 件以上、1000 件以上の有効調査数をもつ作物-病害の組み合わせはそれぞれ
+`r sum(disease_damage_stats$stats$n_records >= 1)`,
+`r sum(disease_damage_stats$stats$n_records >= 10)`,
+`r sum(disease_damage_stats$stats$n_records >= 100)`,
+`r sum(disease_damage_stats$stats$n_records >= 1000)` 通りである。
+
+
+```{r}
+disease_damage_stats$stats
+disease_damage_stats$fig
+```
+
+
+### 作物虫害被害率
+
+1 件以上、10 件以上、100 件以上、1000 件以上の有効調査数をもつ作物-病害の組み合わせはそれぞれ
+`r sum(pest_damage_stats$stats$n_records >= 1)`,
+`r sum(pest_damage_stats$stats$n_records >= 10)`,
+`r sum(pest_damage_stats$stats$n_records >= 100)`,
+`r sum(pest_damage_stats$stats$n_records >= 1000)` 通りである。
+
+
+```{r}
+pest_damage_stats$stats
+pest_damage_stats$fig
+```
+
+
+データとしては害虫による被害だが、大豆べと病とくり実炭そ病の 2 病害が混ざっている。
+
+
+
+## データ整理
+
+作物病害発病率および作物虫害被害率は基本的に病害あるいは虫害が発生している発生率である。
+作物害虫寄生率は害虫が寄生している割合だが、多ければそれなりに被害が大きいと考えることができるため、虫害被害率と考えることができる。また、将来的に虫害リスクになるため、将来予測などにも利用できる。作物害虫寄生率と作物虫害被害率の両者が調査される項目もあれば、どちらか片方で調査される項目もある。実際のオーバーラップを確認してみる。
+
+
+```{r overlap_of_three_items}
+pest_parasitism_labels <- paste(pest_parasitism_stats$stats$crop, pest_parasitism_stats$stats$item, sep = '-')
+disease_damage_labels <- paste(disease_damage_stats$stats$crop, disease_damage_stats$stats$item, sep = '-')
+pest_damage_labels <- paste(pest_damage_stats$stats$crop, pest_damage_stats$stats$item, sep = '-')
+
+ggvenn(list(`pest parasitism` = pest_parasitism_labels,
+            `disease damage` = disease_damage_labels,
+            `pest damage` = pest_damage_labels),
+       fill_color = c('#BC3C29', '#0072B5', '#20854E'),
+       stroke_size = 0.5,
+       set_name_size = 5)
+```
+
+作物害虫寄生率と作物虫害被害率は
+`r length(intersect(pest_parasitism_labels, pest_damage_labels))`
+の組み合わせ（作物-病害）でオーバーラップしているが、
+それぞれ独自に調査されている組み合わせが大多数である。
+両者はどちらも虫害のリスクを表す指標なので、
+そこで、作物害虫寄生率と作物虫害被害率を一緒に扱うことにする。
+
+また、作物病害発病率は病害に対する調査で、基本的に虫害と同じように扱える。
+そこで、データの一括解析を簡単に行えるようするために、作物病害発病率、作物害虫寄生率、作物虫害被害率をすべてマージして一つの調査項目としてまとめる。
+この際に、同一都道府県・同一年月・同一作物・同一病害調査に複数回の調査が行われた場合（上旬と下旬で調査されている場合、発病葉率と発病株率の両方が調査されている場合、作物害虫寄生率と作物虫害被害率の両方が調査されている場合などのケース）、その最大値を残す処理を行う。
+
+```{r trend_investigation_damagedRate}
+if (!exists('pdpdb_v2')) {
+    pdpdb_v2 <- pdpdb %>%
+        mutate(survey = str_replace(survey, '(作物害虫寄生率|作物病害発病率|作物虫害被害率)',
+                                    '作物被害率'),
+               item = str_replace_all(item, '細菌性腐敗\\(腐敗病・軟\\)腐病', '細菌性腐敗'),
+               item = str_replace_all(item, 'ナシマルカイガラムシ\\(サンホーゼカイガラムシ\\)', 'ナシマルカイガラムシ'))
+    pdpdb_v2_damages <- pdpdb_v2 %>%
+                            filter(survey == '作物被害率') %>%
+                            mutate(value = as.numeric(value)) %>%
+                            filter(value != is.na(value)) %>%
+                            filter(value <= 100)
+    dmg <- melt2array_by_invest(pdpdb_v2_damages, 'survey', '作物被害率',
+                                summarise_by_month = TRUE, summarise_fun = max)
+    save(list = ls(), file = TRENDS_RDATA)
+}
+```
+
+上の処理では、一部のデータに単位が % であるにもかかわらず、100 を超える値をとっているものがあるため、それぞ除いているステップが含まれる。
+
+```{r over_100_percentage}
+pdpdb_v2 %>%
+    filter(survey == '作物被害率') %>%
+    mutate(value = as.numeric(value)) %>%
+    filter(value != is.na(value)) %>%
+    filter(value > 100)
+```
+
+# 作物被害率の傾向調査
+
+これ以降、同一都道府県・同一年月・同一作物・同一病害調査に複数回の調査が行われた場合、その最大値が使われる、ということに注意。
+
+
+## 調査項目（作物-病害）と調査件数の内訳
+
+"作物-病害"の組み合わせでみた時の調査件数について調べる。
+
+```{r count_valid_records}
+dmg_stats <- count_valid_records_item(dmg)
+dmg_stats$stats
+```
+
+調査が特定の組み合わせで集中的に調査されている。
+例えば、表の上の方にランクインされている
+`r paste(dmg_stats$stats$crop[1], dmg_stats$stats$item[1], sep = '-')`,
+`r paste(dmg_stats$stats$crop[2], dmg_stats$stats$item[2], sep = '-')`,
+`r paste(dmg_stats$stats$crop[3], dmg_stats$stats$item[3], sep = '-')`,
+`r paste(dmg_stats$stats$crop[4], dmg_stats$stats$item[4], sep = '-')`,
+などの組み合わせの調査件数がとくに多い。
+一方で、イチゴ-シロイチモジヨトウ、キュウリ-ハスモンヨトウと行った組み合わせは数件しかない。
+
+この表の `n_records` がどのような分布となっているのかをプロットしてみる。
+
+
+```{r}
+dmg_stats$fig
+```
+
+（病害・虫害による）作物被害率の調査件数の分布をみると、きれいな対数正規分布となっている。
+また、1 件以上、10 件以上、100 件以上、1000 件以上の有効調査数をもつ作物-病害の組み合わせはそれぞれ
+`r sum(dmg_stats$stats$n_records >= 1)` (`r round(sum(dmg_stats$stats$n_records >= 1) / nrow(dmg_stats$stats) * 100, 2)`%),
+`r sum(dmg_stats$stats$n_records >= 10)` (`r round(sum(dmg_stats$stats$n_records >= 10) / nrow(dmg_stats$stats) * 100, 2)`%),
+`r sum(dmg_stats$stats$n_records >= 100)` (`r round(sum(dmg_stats$stats$n_records >= 100) / nrow(dmg_stats$stats) * 100, 2)`%),
+`r sum(dmg_stats$stats$n_records >= 1000)` (`r round(sum(dmg_stats$stats$n_records >= 1000) / nrow(dmg_stats$stats) * 100, 2)`%) 通りである。
+
+
+また、この表を図示して、どの作物-病虫害の組み合わせでデータ件数が多いのかを網羅的に確認してみる。
+
+```{r plot_trend_cropsxdisease, eval=FALSE}
+dmg_stats_mat_fig <- ggplot(dmg_stats$stats, aes(x = crop, y = item, fill = n_records)) +
+    geom_tile() +
+    coord_equal() +
+    geom_text(aes(label = n_records), size = 2) +
+    scale_fill_gradient2(low = 'white', high = '#C80813',
+                         limit = c(0, max(dmg_stats$stats$n_records)),
+                         name = 'n_records') +
+    theme_bw(base_family = 'HiraKakuPro-W3') +
+    theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    xlab('crop') + ylab('disease & pest')
+
+png(file.path(PROJECT_DPATH, 'notes', 'trends', 'n_records.png'), 2000, 4600, res = 200)
+print(dmg_stats_mat_fig)
+dev.off()
+```
+
+![](trends/n_records.png)
+
+データ調査では、
+`r paste(levels(dmg_stats$stats$crop)[1:10], collapse = ', ')` などの作目に対して多くの病虫害を調査している。
+また、
+`r paste(levels(dmg_stats$stats$item)[1:10], collapse = ', ')` などの調査が多くの作目間で行われている。
+
+
+
+## 作物被害率のデータ分布
+
+作物被害率は 0 以上 100 以下の値をとる。
+
+そこで、すべての作物-病害の組み合わせでみたときに、
+実際にどのような値が多いのかをヒストグラムで確認してみる。
+
+```{r value_dist_of_valid_records}
+ggplot(data.frame(value = dmg[!is.na(dmg)]), aes(x = value)) +
+    geom_histogram() +
+    scale_x_continuous(trans = 'log10') +
+    xlab('log10(value)')
+```
+
+
+記録が 0.1% (1e-01) を超えるあたりから、ヒストグラムがほぼ対数正規分布になっている。納得いく分布となっている。
+
+しかし、0.1% 以下あたりに不自然なピークがみられる。
+実際に、作物被害率として記録されている 0.1% よりも低いデータの件数は `r sum(dmg[!is.na(dmg)] < 0.1)` 件あるが、
+0.1% にぴったり一致するデータの件数は `r sum(dmg[!is.na(dmg)] == 0.1)` 件ある。
+同様に、0.2%, 0.3%, 0.4%, 0.5% にぴったり一致するデータの件数はそれぞれ
+`r sum(dmg[!is.na(dmg)] == 0.2)`,
+`r sum(dmg[!is.na(dmg)] == 0.3)`,
+`r sum(dmg[!is.na(dmg)] == 0.4)`,
+`r sum(dmg[!is.na(dmg)] == 0.5)` 件ある。
+このあたり数値は人為的に丸めて記録している可能性が高い。
+
+
+次に、1%, 2%, ..., 10% にぴったり一致するデータの件数をみてみると、それぞれが
+`r sum(dmg[!is.na(dmg)] == 1)`,
+`r sum(dmg[!is.na(dmg)] == 2)`,
+`r sum(dmg[!is.na(dmg)] == 3)`,
+`r sum(dmg[!is.na(dmg)] == 4)`,
+`r sum(dmg[!is.na(dmg)] == 5)`,
+`r sum(dmg[!is.na(dmg)] == 6)`,
+`r sum(dmg[!is.na(dmg)] == 7)`,
+`r sum(dmg[!is.na(dmg)] == 8)`,
+`r sum(dmg[!is.na(dmg)] == 9)`,
+`r sum(dmg[!is.na(dmg)] == 10)`
+であった。
+1%, 2% にぴったり一致するデータの件数も不自然に多い。
+このあたりも、人為的に 1%, 2% に丸めて記録している可能性が高い。
+
+
+以上と合わせて、低い数値は人為的にその値に丸めている可能性がある。
+そのため、低い数値に対する解析をそのまま行うのが妥当でないと考えられる。
+解析にあたり、
+
+- データを発生あり・なしへのバイナリ変換を解析する
+- 低い値のみをバイナリ変換して、高い値をそのままにして、やや煩雑に解析する
+
+かの方法が妥当と思われる。低い数値を特別扱わないと、正確な解析ができない。
+
+
+
+
+## 作物被害率の時系列可視化
+
+実際のデータを時系列で可視化する。
+
+```{r plot_trend_investigation_pest, eval=FALSE}
+# plot_trend_scatters
+#
+# Plot values for each prefecture with scatter plot.
+# x-axis is year and y-axis is value.
+plot_trend_scatters <- function(x, output_dpath = NULL, n_min = 100) {
+    if (is.null(output_dpath)) stop('`output_dpath` cannot be NULL.')
+    if (!file.exists(output_dpath)) dir.create(output_dpath, recursive = TRUE)
+    
+    crops <- dimnames(x)[[1]]
+    items <- dimnames(x)[[2]]
+    for (crop in crops) {
+        for (item in items) {
+            y <- as.matrix(x[crop, item, , ]) %>%
+                as_tibble(rownames = 'location') %>%
+                tidyr::pivot_longer(!location, names_to = 'date', values_to = 'value') %>%
+                dplyr::filter(!is.na(value)) %>%
+                mutate(location = factor(location, levels = LOCAL),
+                       month = str_sub(date, 6, 7),
+                       date = as.Date(date))
+            if (length(y$location) <= n_min) next
+            f <- ggplot(y, aes(x = date, y = value, col = month)) +
+                geom_point() +
+                theme_bw(base_family = 'HiraKakuPro-W3') +
+                theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+                scale_color_simpsons() +
+                scale_x_date(date_labels = "%Y", limits = range(pdpdb$date, na.rm = T)) +
+                facet_wrap(~ location, ncol = 6, scales = 'free_y', drop = FALSE)
+            
+            png(file.path(output_dpath, paste0(crop, '-', item, '.png')), 
+                4800, 2600, res = 200)
+            print(f)
+            dev.off()
+        }
+    }
+}
+
+plot_trend_scatters(dmg,
+                    output_dpath = file.path(PROJECT_DPATH, 'notes', 'trends', '作物病害発病率'),
+                    n_min = 100)
+```
+
+
+実際に作図されたものうち、記録数の多い上位の調査をいくつか確認してみる。
+
+
+### キュウリ-うどんこ病
+
+- 福島県、京都府などでは、2000-2010 年間では被害率が高かったが、2010 年とくに 2015 年以降では被害率がかなり低くなった。栽培がすくなったのか、それとも品種改良が行われたのか。
+- 徳島県や長崎県では、調査率が上がって下がるような傾向が見られる。
+
+
+
+![](trends/作物病害発病率/キュウリ-うどんこ病.png)
+
+
+### キュウリ-べと病
+
+- キュウリ-べと病とキュウリ-うどんこ病の被害率に相関がみられそう。また、両者の調査期間もほぼ同じ様に見える。
+ 
+
+
+![](trends/作物病害発病率/キュウリ-べと病.png)
+
+
+
+### なし-黒星病
+
+![](trends/作物病害発病率/なし-黒星病.png)
+
+
+### かんきつ-ミカンハダニ
+
+- かんきつ類を栽培している西日本に調査データが集中している。
+- 調査期間を通してほぼ同じような害虫寄生率を取る県がある。香川県、愛媛県など。
+- 調査期間の後半で害虫寄与率が減少している県がある。徳島県、沖縄県など。
+
+![](trends/作物病害発病率/かんきつ-ミカンハダニ.png)
+
+
+### イチゴ-アブラムシ類
+
+- 千葉県、神奈川県、宮崎県、静岡県、徳島県などでは、基本的に 10 月〜 3 月ごろに調査が行われている。いちごの栽培時期。
+- 愛媛県、長崎県、福岡県では 5 月〜 8 月でも調査が行われている。ハウス栽培でしょうか。
+
+![](trends/作物病害発病率/イチゴ-アブラムシ類.png)
+
+
+### トマト-アブラムシ類
+
+- アブラムシ類に対する調査だが、イチゴのアブラムシ類の調査結果とは異なる傾向を示す。
+
+
+![](trends/作物病害発病率/トマト-アブラムシ類.png)
+
+
+### キャベツ-アブラムシ類
+
+- イチゴやトマトとの相関があまり見られない。これを主張するには、同一虫害における作目間の相関解析を行う必要がある。
+
+
+![](trends/作物病害発病率/キャベツ-アブラムシ類.png)
+
+
+## 同一病害・虫害の作目間の相関
+
+相関は、作目1-病害aと作目2-病害aの相関に対して、同一年月・同一都道府県のデータを利用して計算した。
+また、作目1-病害aの年月y都道府県xにデータがあり、作目2-病害aの年月y都道府県xにデータがない場合は、相関計算に利用しない。
+
+まず、例として"キュウリ-うどんこ病"と"イチゴ-うどんこ病"の相関を計算してみる。
+
+```{r calc_cor_udonko}
+.a <- as.numeric(dmg['キュウリ', 'うどんこ病', , ])
+.b <- as.numeric(dmg['イチゴ', 'うどんこ病', , ])
+ggplot(data.frame(cucumber = .a, strawberry = .b),
+       aes(x = cucumber, y = strawberry)) +
+    geom_point()
+cor(.a, .b, method = 'pearson', use = 'pairwise.complete.obs')
+```
+
+図のようにほとんど相関していないことがわかる。
+
+では、次にうどんこ病について、全作物間の相関を求めてみる。
+
+```{r calc_cor_udonko_across_crops}
+calc_corr <- function(x, item = NULL) {
+    cormat <- NULL
+    x <- x[, item, , ]
+    .x.keep <- (apply(!is.na(x), 1, sum, na.rm=TRUE) > 0)
+    if (sum(.x.keep) > 1) {
+        x <- x[.x.keep, , ]
+        y <- matrix(NA, ncol = dim(x)[1], nrow = dim(x)[2] * dim(x)[3])
+        colnames(y) <- dimnames(x)[[1]]
+        combn <- subset(expand.grid(colnames(y), colnames(y)),
+                        unclass(Var1) < unclass(Var2))
+        combn <- data.frame(x = as.character(combn$Var1),
+                            y = as.character(combn$Var2))
+        for (ci in 1:nrow(combn)) {
+            .d <- cbind(as.numeric(x[combn$x[ci], , ]),
+                        as.numeric(x[combn$y[ci], , ]))
+            .d.keep <- apply(!is.na(.d), 1, all)
+            if (sum(.d.keep) > 1) {
+                .d <- .d[.d.keep, ]
+                cormat <- rbind(cormat,
+                                data.frame(item = item,
+                                           crops = paste(combn$x[ci], combn$y[ci], sep = ' x '),
+                                           cor = cor(.d[, 1], .d[, 2], method = 'pearson'),
+                                           n_samples = nrow(.d)))
+            }
+        }
+    }
+    cormat
+}
+calc_corr(dmg, item = 'うどんこ病')
+```
+
+すべての病害について見てみる。求めた相関をグラフにしてみるので、少しデータを整理しながら相関を計算する。
+
+```{r calc_cors_for_all_combinations}
+cormat <- NULL
+for (i in dimnames(dmg)[[2]]) {
+    cormat <- rbind(cormat, calc_corr(dmg, item = i))
+}
+
+cormat <- cormat %>%
+    filter(!is.na(cor)) %>%
+    as_tibble()
+cormat
+```
+
+病害ごとの相関の分布を眺めてみる。
+
+データ数が 2 つしかない場合は相関が 1.0 になるので、少ないデータから計算される相関が信用になれないので、とりあえず相関を計算したサンプル数が 10 以上の項目に対して、相関の分布を作図してみる。
+
+
+```{r plot_cor_jitter}
+cormat %>%
+    filter(n_samples >= 10) %>%
+    ggplot(aes(x = item, y = cor, color = item, size = n_samples)) +
+        geom_violin() +
+        geom_jitter(alpha = 0.5) +
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5),
+              legend.position = 'none')
+```
+
+
+相関があるように見えない。サンプル数が多い（上の図の点が大きい）と、相関係数がゼロに近い値をとっているようである。つまり、データが少なければ相関が高くなりやすい可能性がある。
+
+そこで、横軸を相関計算に利用したサンプル数、縦軸に相関をプロットした散布図を作成してみる。
+
+
+
+```{r plot_cor_scatter}
+ggplot(cormat, aes(x = n_samples, y = cor, col = item)) +
+    geom_point() +
+    scale_x_log10() +
+    theme(legend.position = 'none')
+```
+
+この散布図をみると、確かに、サンプル数が少ないとき、正の相関あるいは負の相関になりやすい。
+逆に、サンプル数が多いとき、相関係数が -0.25~+0.25 の範囲にあり、ほぼ相関なしである。
+
+また、点の色は病害の種類を表している。色の分布もランダムなので、「アブラムシ類の相関が高くて、うどんこ病の相関が低い」ということもない。
+
+
+ここから言えることとして、
+
+- 同じ病害でも、作目間での相関はなさそう。
+    - 例えば、キュウリのうどんこ病の発病率が高くても、同日同一場所におけるトマトのうどんこ病の発病率が高くなるとは限らない。
+- データ解析において欠損値がある場合、（相関がないために）その欠損値を他の作目の値を利用して補正できない。
+    - 欠損値の多い作物-病害を解析する際に、その作物-病害内でどうにか補正するしかない。あるいは、この作物-病害のデータを対象から外す。
+    
+
+繰り返しになるが、"作目-病害"の組み合わせそれぞれに対して、個別に解析を進める必要がある。
+複数作目同一病害のデータをマージして解析するのは不適と思われる。
+
+
+## 作物被害率の月間傾向
+
+りんごや柑橘類などのように多年木のほかに、キュウリ、トマトなどのように季節ごとに育てる作目もある。
+また、発生する病害や虫害も季節の影響を受ける可能性がある。
+そのため、作物被害率は月毎に特定の傾向を持つかもしれない。
+たとえば、4月にはアブラムシ類による虫害が多く発生するが、7 月ではほとんど発生しなくなる、というような季節傾向が見られる。
+
+そこで、このような季節傾向をみるために、作物被害率を月ごとにグルーピングして、可視化してみる。
+まず、データの多い愛媛県のキュウリ-うどんこ病の作物被害率の月間傾向を見てみる。
+確かに季節（月）によって作物被害率が異なる様に見える。
+
+```{r}
+data_summary_func <- function(x) {
+    c(y = mean(x), ymin = mean(x) - sd(x), ymax = mean(x) + sd(x))
+}
+
+as.matrix(dmg['キュウリ', 'うどんこ病', , ]) %>%
+    as_tibble(rownames = 'location') %>%
+    pivot_longer(- location, names_to = 'date', values_to = 'value') %>%
+    filter(!is.na(value)) %>%
+    filter(location == '愛媛県') %>%
+    mutate(year = str_sub(date, 1, 4),
+           month = str_sub(date, 6, 7)) %>%
+    ggplot(aes(x = month, y = value, color = month, group = month)) +
+        geom_violin() +
+        geom_jitter(alpha = 0.3) +
+        stat_summary(fun.data = data_summary_func,
+                     geom = 'pointrange', width = 0.2, col = '#333333') +
+        scale_color_simpsons() +
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(legend.position = 'none') 
+```
+
+キュウリ-うどんこ病の全国の月間傾向を見てみる。
+
+```{r, eval=FALSE}
+as.matrix(dmg['キュウリ', 'うどんこ病', , ]) %>%
+    as_tibble(rownames = 'location') %>%
+    pivot_longer(- location, names_to = 'date', values_to = 'value') %>%
+    filter(!is.na(value)) %>%
+    mutate(location = factor(location, levels = LOCAL),
+           year = str_sub(date, 1, 4),
+           month = str_sub(date, 6, 7)) %>%
+    ggplot(aes(x = month, y = value, color = month, group = month)) +
+        geom_violin() +
+        geom_jitter(alpha = 0.3) +
+        stat_summary(fun.data = data_summary_func,
+                     geom = 'pointrange', width = 0.2, col = '#333333') +
+        scale_color_simpsons() +
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(legend.position = 'none') +
+        facet_wrap(~ location, ncol = 6, scales = 'free_y', drop = FALSE)
+```
+
+![](trends/作物病害発病率月間傾向/キュウリ-うどんこ病.png)
+
+都道府県ごとに得意的な傾向が見られる。
+例えば、茨城と神奈川などでは、春から夏に向かって被害が徐々に増加していくが、真夏（7-9月）になると一時収束が見られ、その後、秋から冬に向かって被害が再び増加傾向にある。
+これはキュウリが２つの時期に栽培され、春夏キュウリと秋冬キュウリの特徴に応じたものと考えられる。
+
+では、このような図とすべての病害に対して作図してみる。
+
+```{r plot_monthly_trend, eval=FALSE}
+plot_trend_monthly <- function(x, output_dpath = NULL, n_min = 100) {
+    if (is.null(output_dpath)) stop('`output_dpath` cannot be NULL.')
+    if (!file.exists(output_dpath)) dir.create(output_dpath, recursive = TRUE)
+    
+    crops <- dimnames(x)[[1]]
+    items <- dimnames(x)[[2]]
+    for (crop in crops) {
+        for (item in items) {
+            y <- as.matrix(x[crop, item, , ]) %>%
+                as_tibble(rownames = 'location') %>%
+                tidyr::pivot_longer(!location, names_to = 'date', values_to = 'value') %>%
+                dplyr::filter(!is.na(value)) %>%
+                mutate(location = factor(location, levels = LOCAL),
+                       month = str_sub(date, 6, 7),
+                       
+                       date = as.Date(date))
+            if (length(y$location) <= n_min) next
+            
+            f <- ggplot(y, aes(x = month, y = value, color = month, group = month)) +
+                    geom_violin() +
+                    geom_jitter(alpha = 0.3) +
+                    stat_summary(fun.data = data_summary_func,
+                                 geom = 'pointrange', width = 0.2, col = '#333333') +
+                    scale_color_simpsons() +
+                    theme_bw(base_family = 'HiraKakuPro-W3') +
+                    theme(legend.position = 'none') +
+                    facet_wrap(~ location, ncol = 6, scales = 'free_y', drop = FALSE)
+            
+            png(file.path(output_dpath, paste0(crop, '-', item, '.png')), 
+                4800, 2600, res = 200)
+            print(f)
+            dev.off()
+        }
+    }
+}
+
+plot_trend_monthly(dmg,
+                   output_dpath = file.path(PROJECT_DPATH, 'notes', 'trends', '作物病害発病率月間傾向'),
+                   n_min = 100)
+```
+
+
+いくつかの代表例を見てみる。
+
+### キュウリ-べと病
+
+![](trends/作物病害発病率月間傾向/キュウリ-べと病.png)
+
+
+### イチゴ-アブラムシ類
+
+![](trends/作物病害発病率月間傾向/イチゴ-アブラムシ類.png)
+
+
+
+### トマト-アブラムシ類
+
+![](trends/作物病害発病率月間傾向/トマト-アブラムシ類.png)
+
+
+### キャベツ-アブラムシ類
+
+![](trends/作物病害発病率月間傾向/キャベツ-アブラムシ類.png)
+
+
+### かんきつ-ミカンハダニ
+
+![](trends/作物病害発病率月間傾向/かんきつ-ミカンハダニ.png)
+
+### 月間傾向のまとめ
+
+月毎にデータを丸めてみたときに、月トレンドがはっきり見えてくる。この理由として、
+
+- 作物には栽培時期があるので、その栽培時期においてのみ病害が発生する。
+- 病害・虫害が発生するには気象条件がウィルス・害虫の生存に適している場合である。そのため、四季がはっきりしている日本では、季節ごとにその発生トレンドが現れやすい。
+- 品種改良などや農薬散布などがあるため、気象データを用いて発生率を予測するのは妥当ではない可能性がある。
+
+もしかしたら、季節変動を取り入れた従来の時系列解析だけでもうまく翌年度の発生率を予測できるかもしれない。状態空間モデルを用いて推定してもよさそう。
+
+
+
+
+
+
+
+
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

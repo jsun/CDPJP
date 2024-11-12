@@ -1,0 +1,633 @@
+---
+title: '作物被害率モデリング'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float:
+            collapsed: false
+        number_sections: true
+        df_print: paged
+date: '`r Sys.Date()`'
+author: 'jsun'
+---
+
+
+# 解析環境
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(stringi)
+library(knitr)
+library(ggsci)
+library(ggvenn)
+library(R6)
+library(ggpubr)
+library(patchwork)
+source('model_core.R')
+PROJECT_DPATH <- '~/projects/jp_pdpdb'
+DB_HOST <- file.path(PROJECT_DPATH, 'data/db.sqlite3')
+MODELS_RDATA <- file.path(PROJECT_DPATH, 'data/MODELS.RData')
+if (file.exists(MODELS_RDATA)) load(MODELS_RDATA)
+OVERWRITE <- FALSE
+```
+
+```{r, echo=FALSE}
+colorize <- function(x, color = '#BC3C29') {
+    if (knitr::is_latex_output()) {
+        sprintf("\\textcolor{%s}{%s}", color, x)
+    } else if (knitr::is_html_output()) {
+        sprintf("<span style='color: %s;font-weight:bold;'>%s</span>", color, x)
+    } else x
+}
+```
+
+
+# データセット読み込み
+
+整理済みデータベースからデータを読み込む。データベースに接続。
+
+```{r}
+con <- RSQLite::dbConnect(RSQLite::SQLite(), DB_HOST, synchronous = 'off')
+```
+
+データを変数に読み込む。
+
+```{r load_weather_data}
+WD <- select_weatherData(con)
+WD
+```
+
+
+```{r load_damage_data}
+DR <- select_damageData(con)
+dim(DR)
+DR['キュウリ', 'うどんこ病', , ] |> as_tibble(rownames = 'date')
+``` 
+
+
+# モデリング構想
+
+目標として、データの最終月の翌月から将来一年分の作物病害・虫害の被害率を予測するモデルを作成する。
+
+## 調査データの傾向の再確認
+
+サンプルとして、キュウリ-うどんこ病の病害・虫害の被害率データを再確認する。
+
+![](trends/作物病害発病率月間傾向/キュウリ-うどんこ病.png)
+
+あらためて画像をみると
+
+1. 愛媛県、高知県は年間を通してデータが収集されている。
+2. 茨城県、千葉県は夏の間は（年の途中で）データが収集されていない。
+3. 京都府、香川県は年の夏秋の時期にデータが収集されている。一方で年末年始のデータがない。
+4. 岐阜県、広島県、埼玉県など、明らかにデータが少ない。
+
+などの特徴がある。1-3 の理由として、
+
+- 県によって通年で栽培されていない
+- 解析用のデータでは、春夏作物と秋冬作物をまとめたため
+
+が原因として考えられる。
+また、4 の理由として、そもそも栽培が少ないためにデータが少ないと考えられる。
+
+
+## モデリング戦略
+
+以上のことを踏まえて、モデリング戦略を以下のように立てる。
+
+### 前処理
+
+- データが少ない県について、「データ不足のためモデル化不可能」としてモデリングしない。
+    - 1 つの月に最低 3 点（3 年分）存在しないと正確な分散を推定ができないので、3 を閾値としてフィルタリングする。
+    - 3 点未満の月をデータが存在しない月として扱う。
+- 年間を通してデータが存在している県について、そのままモデリングする。
+- 年のうち一部の月にデータが収集されていない場合、それらの月がないものとして、扱う。
+    - 例えば、2, 3, 4, 5, 9, 10, 11 月のデータのみが存在するとき、1 年に 7 ヶ月しかいなものとして扱う。
+- 欠損値が存在する場合、直前 n 年間のその県・月の平均値で補正する。
+    - 例えば、神奈川県 2021 年 2 月の値が欠損しているならば、n = 5 としたとき、2016-2020 年の 2 月の平均値で補正する。
+    - 「n = 1, 2, ..., 10, 全期間」で補正して、交差検証行い、最適な n を決定する。
+      1. n = 5 の場合、1996-2000 の各月の平均値で 2001 の各月の予測値として、実際の調査値と比べて検証する。
+      2. 次に、1997-2001 の平均値を 2002 の予測値として検証する。
+      3. 時系列の末端に達するまで、1-2 の作業を繰り返す。各繰り返しで計算された RMSE を記録する。
+      4. n = 1, 2, ..., 10, 過去全期間と変化させながら、1-3 の作業を繰り返す。
+      5. 各 n において複数の RMSE が計算されるが、それぞれの n においてその平均値を計算し、交差検証の性能とする。最小平均 RMSE を与える n を最適値とする。
+      6. 作物・病害・県ごとに最適な n が存在すると思われる。これは作物・病害・県の特徴を反映しているためと思われるので、無理に 1 の値にまとめない。
+
+### モデル構築とモデル検証
+
+- モデリング方法
+    - `r colorize('PastAvg Model')` / 過去平均値モデル：欠損値補正に利用した方法を平均値モデルとする。
+    - `r colorize('ARIMA Model')` / ARIMA モデル：季節変動を取り入れた時系列モデル。過去の被害率のみを利用して予測を行うモデル。
+    - `r colorize('GPR Model')`` / ガウス過程回帰モデル：時系列データをガウス過程回帰でモデルかを行う。欠損値が存在している場合自動的に無視され、データの多いところではより正確（信頼区間が狭く）に適合するようなモデル。欠損値の存否を気にせずに扱えるので、便利なモデリング方法。
+    - `r colorize('SS Model')` / 状態空間モデル。
+    - `r colorize('LSTM Model')` / LSTM モデル。1 層だけからなる LSTM を想定。
+    - `r colorize('RANDOM Model')` / ランダムモデル：過去の被害率の平均と分散を利用して、乱数を発生させて、その乱数を次年度の被害率として扱うモデル。真面目な他のモデルが乱数に比べて良いかどうかを比べるために使う。
+- 評価
+    - 上述 4 モデルを評価。
+    - 目的変数である被害率が大きい作物・病虫害ほど、理論上、RMSE も大きくなる。このままでは、作物間、病虫害間での比較ができない。たま、たとえ同じ作物・病虫害であっても県間で比較できない。
+        - 出力された RMSE をそのまま使用せずに、正規化された RMSE を使用する。
+        - いろんな正規化手法があるが、目的変数を正規化せずに、RMSE を sd で正規化するのがよさそう。[参照](https://www.marinedatascience.co/blog/2019/01/07/normalizing-the-rmse/)
+    - 比較結果から気象条件が被害率に与える影響を考察できる。気象条件と大きな相関を持つ病害・虫害が存在するかもしれない。
+  - 注意点
+    - データのない月はデータの少ない月はモデリング対象に含まれない。
+  
+
+# モデリング
+
+
+## 過去平均値モデル (PastAve Model)
+
+このモデルでは、過去 n 年分の月毎の平均を将来 1 年の各月の被害率として算出している。
+n はデータの特徴によって異なる値をとると考えられるため、
+すべての作物・病虫害・都道府県に対して、時系列交差検証をして、最適なモデル（最適な n）を計算する。
+
+
+### 予備モデリング
+
+まず一例を見てみる。上図より、キュウリのうどんこ病でデータが多そうなのは愛媛県なので、愛媛県で予備モデリング。
+
+```{r pa_model_example}
+x <- arrange_dataset(DR, WD, crop = 'キュウリ', damage = 'うどんこ病', prefecture = '愛媛県')
+m <- CropDamageForecastModel$new('PA', x$date, x$value)
+m$fit(n_min = 3)
+unlist(m$get_field('params'))
+```
+
+交差検証の結果、最適な n は `r m$get_field('params')$n` である。このときの時系列 RMSE は次の値となっている。
+
+```{r pa_model_example_rmse}
+m$get_field('valid_stats')$rmse
+```
+
+`n = c(1:10, Inf)` で交差検証したときの RMSE は次のように確認できる。
+この RMSE の分布はデータによって正規分布に似ていたり、双峰性の正規分布に似ていたり、
+ゼロの近くに多くの値が集中するような対数正規分布に似ていたりする。
+例えば t=1 と t=2 を比べるとき、両者の平均を使うのはやや不適である。
+とはいえデータが多いので、いちいち RMSE の分布を推定してからその中央に当たる指標を計算するのも不効率。
+ここでは、すべてのデータを網羅的に解析すべく、簡単に計算できる指標として中央値を採用した。
+（単に計算が簡単で、平均よりマシという理由だけ。）
+
+```{r pa_model_example_rmsegs}
+m$get_field('valid_stats')$rmse_ts
+```
+
+試しにデータの最終月から 12 ヶ月先の被害率を予測してみる。
+基本的に平均値を予測値として出力しているだけ。95% 信頼区間は 平均+/-標準偏差x1.96で計算したものを出力している。
+直近 n 年間のデータが同じだったりする場合、標準偏差が 0 になるので、信頼区間を計算できない。この場合、信頼区間は NA となっている。
+また、平均 - 標準偏差x1.96 で負の値になるものが出てくるので、これについてはゼロに書き換えた。
+
+ただし、このケースではパラメータ `n=1` となっているので、過去 1 の平均を翌年の予測値としているので、
+平均は計算できるものの、標準偏差が計算されないので、信頼区間は NA となっている。
+
+
+```{r}
+last_12m <- as.Date(tail(sort(unique(x$date)), 12))
+m_pred <- m$predict(as.character(last_12m %m+% months(12)),
+                    interval = TRUE, level = 0.95)
+m_pred
+```
+
+
+### モデリング
+
+このような検証をすべての作物・病虫害・都道府県に対して行う。
+実際に実行するとかなり時間がかかるので、`run_modeling.R` 単体をバックグラウンドで実行して、
+その結果として、モデルを `models` 変数に、RMSE を `rmses` に保存している。
+
+
+```{r create_pa_models, eval=FALSE}
+# source('run_modeling.R')
+# fit_all()
+```
+
+RMSE を取り出して、あとでその傾向をみてみる。
+
+```{r}
+rmse_pa <- rmses$PA
+```
+
+
+### モデル性能評価
+
+#### 評価結果
+
+モデルの fitting 時に計算した best model の RMSE の分布を確認してみる。
+
+
+```{r}
+rmse_pa |> as_tibble()
+```
+
+
+全部の RMSE の分布を図示してみると次のようになる。横軸は常用対数スケールに注意。
+分布はきれいな正規分布（実際には対数正規分布）となっているようで、とくにおかしいなところはなさそう。
+
+```{r}
+ggplot(rmse_pa, aes(x = log10(rmse))) +
+        geom_histogram(binwidth = 0.05) +
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(legend.position = 'none')
+```
+
+次に、県ごと、作物ごと、病害ごとに塗り分けて確認してみる。
+
+まず、県ごとの結果を確認してみると、長野県のモデルの RMSE が他に比べて低いようだ。
+逆に飛び抜けて RMSE が高い県はなかった。
+（どうでもいいけど、なんで色がグラデーションになってないの？）
+
+```{r}
+rmse_pa |>
+    mutate(prefecture = factor(prefecture, levels = dimnames(DR)[[4]])) |>
+        ggplot(aes(x = prefecture, y = rmse, color = prefecture)) +
+        geom_violin() +
+        geom_jitter() +
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5),
+              legend.position = 'none') +
+        ylim(0, 5)
+```
+
+次に作物間の RMSE を確認してみる。
+RMSE があきらかに他に比べて大きかったり小さかったりする作物はなかった。
+イチゴ、かき、かんきつ、キュウリ、トマト、なし、ネギ、レタス、キャベツ、水稲、茶あたりの点数が多いので、
+これらの作物の調査データが多く、モデルもちゃんと構築されている。
+一方でてんさいやはくさい、ばれいしょ、などはデータがすくなくモデルが作成できなかったことになる。
+
+```{r}
+rmse_pa |>
+    mutate(crop = factor(crop, levels = dimnames(DR)[[1]])) |>
+        ggplot(aes(x = crop, y = rmse, color = crop)) +
+        geom_violin() +
+        geom_jitter() +
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5),
+              legend.position = 'none') +
+        ylim(0, 5)
+```
+
+病害ごとにみても、病害ごとの傾向が見えにくい。
+
+```{r}
+rmse_pa |>
+    mutate(damage = factor(damage, levels = dimnames(DR)[[2]])) |>
+        ggplot(aes(x = damage, y = rmse, color = damage)) +
+        geom_violin() +
+        geom_jitter() +
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5),
+              legend.position = 'none') +
+        ylim(0, 5)
+```
+
+#### 評価結果（RMSE とハイパーパラメータ n の関係）
+
+ある月の過去 n 年間の平均を使って翌年度のその月の予測値とするこのモデルにおいて、どのような n が多かったのかを調べた。n = 1 が圧倒的に多かった。
+
+```{r}
+rmse_pa |>
+    filter(!is.na(n)) |>
+    mutate(n = factor(n, levels = c(1:10, Inf))) |>
+    ggplot(aes(x = n)) +
+        geom_bar(stat = 'count')
+```
+
+n の値と RMSE に相関があるかどうかを調べてみる。n がどんな値になっても、RMSE はほぼ同じ分布傾向を示している。
+長期間にわる過去のデータから平均を計算すれば、その平均が将来予測に有利であるとは言えないようだ。
+多くの場合、1 年前の値をそのまま翌年の予測値として使った方が RMSE が小さくなるという結果が得られた。
+
+```{r}
+rmse_pa |>
+    filter(!is.na(n)) |>
+    mutate(n = factor(n, levels = c(1:10, Inf))) |>
+    ggplot(aes(y = log10(rmse), x = n)) +
+        geom_violin() +
+        geom_boxplot(width = .2, fill = 'white', outlier.shape = 'n') +
+        geom_jitter(alpha = 0.2)
+```
+
+以上より、個々の組み合わせに特に有効な `n` が存在するものの、
+網羅的に見て、過去 1 年間のデータを使って翌年の欠損値を埋める、という操作がよさそう。
+それぞれの組み合わせを考えると、全データを解析する上でコストが上がる。
+
+
+
+## 自己回帰和分移動平均モデル (ARIMA Model)
+
+
+### 予備モデリング
+
+愛媛県のキュウリのうどんこ病のデータで予備モデリング。
+使い方は PastAvg モデルと同じ。
+
+```{r arima_model_example}
+x <- arrange_dataset(DR, WD, crop = 'キュウリ', damage = 'うどんこ病', prefecture = '愛媛県')
+m <- CropDamageForecastModel$new('ARIMA', x$date, x$value)
+m$fit(n_min = 3)
+unlist(m$get_field('params'))
+```
+
+このモデルの RMSE は次のように計算された。
+
+```{r arima_model_example_rmse}
+m$get_field('valid_stats')$rmse
+```
+
+年ごとの RMSE は次のようになっている。
+
+```{r arima_model_example_rmsegs}
+m$get_field('valid_stats')$rmse_ts |> as_tibble(rownames = 'year')
+```
+
+モデルは forecast パッケージの `auto.arima` 関数を利用して作成した。
+このモデルはクラスのプラベート変数に保存されている。
+例えば次のように利用することができる。
+
+```{r arima_model_example_rmse_calc}
+summary(m$.__enclos_env__$private$model_)
+```
+
+
+### モデリング
+
+
+全作物・病虫害・都道府県の組み合わせに対してモデリングを行う。
+（時間がかかるので、ここでは実行していない。）
+
+```{r create_arima_models, eval=FALSE}
+# source('run_modeling.R')
+# fit_all()
+```
+
+fitting RMSE のみ取り出す。
+
+```{r}
+rmse_arima <- rmses$ARIMA
+```
+
+
+
+### モデル性能評価
+
+#### 評価結果
+
+
+```{r}
+rmse_arima |> as_tibble()
+```
+
+
+全部の RMSE の分布を図示してみると次のようになる。横軸は常用対数スケールに注意。
+横軸が -3 よりも小さいものが `r sum(log10(rmse_arima$rmse) < -3, na.rm=T)` 件、
+3 よりも大きいものが `r sum(log10(rmse_arima$rmse) > 3, na.rm=T)` 件
+（うち Inf が `r sum(is.infinite(rmse_arima$rmse), na.rm=T)` 件）であった。
+これらの"外れ値"を除けば、この分布の右側の裾がやや長い。
+
+
+```{r}
+ggplot(rmse_arima, aes(x = log10(rmse))) +
+        geom_histogram(binwidth = 0.05) +
+        xlim(-3, 3) + 
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(legend.position = 'none')
+```
+
+横軸が Inf となっているのは次の組み合わせである。
+データが少なく、スパースだったり（数年の空きがあったり）、
+多くのサンプルが同じ値だったりすることで、モデル化に失敗した可能性がある。
+
+```{r}
+rmse_arima[is.infinite(log10(rmse_arima$rmse)),] |> as_tibble()
+```
+
+
+
+PastAvg モデルに比べると、この ARIMA モデルの RMSE のヒストグラムがやや右側にある。
+網羅的にみて、ARIMA モデルよりも、単純に過去数年間の平均を計算してそれを予測値とした方が良さそうな感じ。
+こういったデータを解析するには複雑な統計モデルを使わなくてもよいかもしれない。
+
+
+```{r}
+rbind(data.frame(rmse = rmse_pa |>
+                        filter(!is.na(rmse), !is.infinite(rmse)) |>
+                        select(rmse),
+                 model = 'PA'),
+      data.frame(rmse = rmse_arima |>
+                        filter(!is.na(rmse), !is.infinite(rmse)) |>
+                        select(rmse),
+                 model = 'ARIMA')) |>
+    ggplot(aes(x = log10(rmse), fill = model)) +
+        geom_histogram(position = "identity", alpha = 0.5, binwidth = 0.05) +
+        xlim(-3, 3)
+```
+
+
+
+
+
+
+## ガウス過程回帰モデル (GPR Model)
+
+
+### モデリング
+
+```{r create_gpr_models, eval=FALSE}
+# source('run_modeling.R')
+# fit_all()
+```
+
+```{r}
+rmse_gpr <- rmses$GPR
+```
+
+
+### モデル性能評価
+
+
+```{r}
+ggplot(rmse_gpr, aes(x = log10(rmse))) +
+        geom_histogram(binwidth = 0.05) +
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(legend.position = 'none')
+```
+
+
+## 状態空間モデル (SS Model)
+
+未実装。PastAvg モデルの方優れている予感がするので、わざわざ実装して比較する意味ある？
+
+
+### モデリング
+
+```{r create_ss_models, eval=FALSE}
+# source('run_modeling.R')
+# fit_all()
+```
+
+```{r, eval=FALSE}
+rmse_ss <- rmses$SS
+```
+
+
+### モデル性能評価
+
+
+
+```{r, eval=FALSE}
+ggplot(rmse_ss, aes(x = log10(rmse))) +
+        geom_histogram(binwidth = 0.05) +
+        xlim(-3, 3) + 
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(legend.position = 'none')
+```
+
+
+
+
+## 長・短期記憶モデル（LSTM Model）
+
+未実装。PastAvg モデルの方優れている予感がするので、わざわざ実装して比較する意味ある？
+
+
+### モデリング
+
+```{r create_lstm_models, eval=FALSE}
+# source('run_modeling.R')
+# fit_all()
+```
+
+```{r, eval=FALSE}
+rmse_lstm <- rmses$LSTM
+```
+
+
+### モデル性能評価
+
+
+```{r, eval=FALSE}
+ggplot(rmse_lstm, aes(x = log10(rmse))) +
+        geom_histogram(binwidth = 0.05) +
+        xlim(-3, 3) + 
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(legend.position = 'none')
+```
+
+
+
+## ランダムモデル (RANDOM Model)
+
+### モデリング
+
+```{r create_random_models, eval=FALSE}
+# source('run_modeling.R')
+# fit_all()
+```
+
+```{r, eval=FALSE}
+rmse_random <- rmses$RANDOM
+```
+
+### モデル性能評価
+
+
+```{r, eval=FALSE}
+ggplot(rmse_random, aes(x = log10(rmse))) +
+        geom_histogram(binwidth = 0.05) +
+        xlim(-3, 3) + 
+        theme_bw(base_family = 'HiraKakuPro-W3') +
+        theme(legend.position = 'none')
+```
+
+
+
+## モデル評価
+
+すべてのモデルを網羅的に評価してみる。まず、RMSE を一つのデータフレームに集める。
+
+```{r}
+rmse <- data.frame()
+for (m in names(rmses)) {
+    rmse <- rbind(rmse,
+                  data.frame(rmses[[m]][(!is.na(rmses[[m]]$rmse)) & (!is.infinite(rmses[[m]]$rmse)),
+                                        c('crop', 'damage', 'prefecture', 'model', 'rmse')], n_samples = NA))
+}
+rmse$model <- factor(rmse$model,
+                     levels = CropDamageForecastModel$new('RANDOM' ,NA, NA)$get_field('valid_model_types')$name)
+
+for (crop in unique(rmse$crop)) {
+    for (damage in unique(rmse$damage)) {
+        for (prefecture in unique(rmse$prefecture)) {
+            k <- (rmse$crop == crop & rmse$damage == damage & rmse$prefecture == prefecture)
+            if (any(k)) rmse$n_samples[k] <- sum(!is.na(DR[crop, damage, , prefecture]))
+        }
+    }
+}
+```
+
+
+まず、各モデルにより計算されている RMSE がどのような分布になっているのかを確認する。
+RANDOM モデルでもわりと小さい RMSE を出力しているのがわかる。
+RANDOM モデルに比べて PA (PastAvg) モデルが全体的に優れているように見える。
+一方で、計算コストの高い ARIMA や GPR などの"高度"なモデルでは RANDOM モデルとの差が小さいことがわかった。
+ただ、全モデルの RMSE の median に着目すると、どのモデルも、RANDOM モデルに比べて明らかによかった。
+
+
+```{r}
+ggplot(rmse, aes(x = model, y = log10(rmse), color = model)) +
+    geom_jitter(alpha = 0.5, size = .5) +
+    geom_violin(alpha = 0.1) +
+    geom_boxplot(width = .2, fill = 'white', outlier.shape = 'n', alpha = 0.5) +
+    ylim(-3, 3) +
+    scale_color_nejm()
+```
+
+```{r}
+rmse |>
+    group_by(model) |>
+    summarise(mean = mean(rmse), median = median(rmse), sd = sd(rmse)) |>
+    ungroup()
+```
+
+
+サンプルの数が多くなれば、各モデルの予測性能が上がるのかを調べてみる。
+サンプルの数が多くなれば確かに真面目なモデル（ARIMA, GPR）の予測性能が上がるようだ。
+
+
+```{r, fig.width=8, fig.height=8, dpi=200, out.width='100%'}
+p1 <- ggplot(rmse, aes(x = log10(n_samples), y = log10(rmse), color = model)) +
+        geom_point(alpha = 0.2) +
+        stat_smooth() +
+        ylim(-2, 2) +
+        scale_color_nejm() +
+        theme_pubr() +
+        theme(legend.position = 'bottom')
+p2 <- ggplot(rmse, aes(x = log10(n_samples), color = model)) +
+        geom_density(alpha = 0.2) +
+        theme_void() +
+        theme(legend.position = 'none') +
+        scale_color_nejm()
+p3 <- ggplot(rmse, aes(x = log10(rmse), color = model)) +
+        geom_density(alpha = 0.2) +
+        theme_void() +
+        theme(legend.position = 'none') +
+        xlim(-2, 2) +
+        scale_color_nejm() +
+        coord_flip()
+p2 + plot_spacer() + p1 + p3 +
+    plot_layout(ncol = 2, nrow = 2, widths = c(4, 1), heights = c(1, 4))
+```
+
+
+# 終了処理
+
+```{r}
+RSQLite::dbDisconnect(con)
+```
+
+## SessionInfo
+
+```{r}
+sessionInfo()
+```
+

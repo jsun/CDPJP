@@ -1,0 +1,500 @@
+---
+title: '病害・虫害調査データ概要'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float:
+            collapsed: false
+        number_sections: true
+        df_print: paged
+date: '`r Sys.Date()`'
+author: 'jsun'
+---
+
+
+# 解析環境
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(stringi)
+library(knitr)
+OVERWRITE <- FALSE
+PROJECT_DPATH <- '~/projects/jp_pdpdb'
+PDPDB_RDATA <- file.path(PROJECT_DPATH, 'data/PDPDB.RData')
+
+LOCAL <- c('北海道',
+           '青森県', '岩手県', '秋田県', '宮城県', '山形県', '福島県',
+           '茨城県', '栃木県', '群馬県', '埼玉県', '千葉県', '東京都', '神奈川県',
+           '山梨県', '長野県', '新潟県', '富山県', '石川県' , '福井県',
+           '岐阜県', '静岡県', '愛知県', '三重県', '滋賀県', '京都府', '大阪府',
+           '兵庫県', '奈良県', '和歌山県',
+           '鳥取県', '島根県', '岡山県', '広島県', '山口県', 
+           '徳島県', '香川県', '愛媛県', '高知県',
+           '福岡県', '佐賀県', '長崎県', '熊本県', '大分県', '宮崎県', '鹿児島県',
+           '沖縄県')
+
+if (file.exists(PDPDB_RDATA) && (!OVERWRITE)) load(PDPDB_RDATA)
+```
+
+
+# データ概要
+
+## データ全体
+
+```{r load_pdpdb_dataset}
+pdpdb <- NULL
+pdpdb_data_files <- list.files(file.path(PROJECT_DPATH, 'data/jppnet'))
+for(pdpdb_data_file in pdpdb_data_files){
+    pdpdb <- rbind(pdpdb,
+                    read_csv(file.path(PROJECT_DPATH, 'data/jppnet', pdpdb_data_file),
+                             locale = locale(encoding='CP932'), show_col_types = FALSE))
+}
+pdpdb <- pdpdb %>% 
+        dplyr::mutate(
+            作物名称 = stri_trans_nfkc(作物名称),
+            病害虫名称 = stri_trans_nfkc(病害虫名称),
+            データ = stri_trans_nfkc(データ)) %>%
+        dplyr::rename(
+            date = 調査年月日,
+            location = 都道府県名称,
+            crop = 作物名称,
+            item = 病害虫名称,
+            survey = 調査名,
+            degree = 程度,
+            value = データ,
+            unit = 単位)
+head(pdpdb)
+```
+
+```{r check_pdpdb_crops}
+pdpdb %>% dplyr::distinct(crop)
+```
+
+```{r check_pdpdb_items}
+pdpdb %>% dplyr::distinct(item)
+```
+
+
+```{r check_pdpdb_surveys}
+pdpdb %>% dplyr::distinct(survey)
+```
+
+```{r check_pdpdb_degrees}
+pdpdb %>% dplyr::distinct(degree)
+```
+
+
+```{r check_pdpdb_units}
+pdpdb %>% dplyr::distinct(unit)
+```
+
+
+記録データは `degree` 列と `value` 列に記録されている。
+`degree` は平年比で記録されているのに対して、`value` は調査数値が記録されている。
+片方にしか記録がない調査項目や両方に記録がある調査項目などがある。
+その中身は次のようになっている。
+
+
+```{r check_valided_records}
+pdpdb_valid_values <- as.matrix(table(is.na(pdpdb$degree), is.na(pdpdb$value)))
+rownames(pdpdb_valid_values) <- c('degree', 'degree_NA')
+colnames(pdpdb_valid_values) <- c('value', 'value_NA')
+pdpdb_valid_values
+pdpdb_valid_values_r <- round(pdpdb_valid_values / sum(pdpdb_valid_values) * 100, 2)
+pdpdb_valid_values_r
+```
+
+`value` と `degree` の両方に有効な値が記録されているのは、全体の
+`r pdpdb_valid_values_r[1,1]`% である。
+`value` 列に有効な値が記録されているのは、全体の
+`r sum(pdpdb_valid_values_r[, 1])`% である。
+`degree` 列に有効な値が記録されいてるのは、全体の
+`r sum(pdpdb_valid_values_r[1, ])`% である。
+
+`degree` 列のデータは前年比あるいは平年比として記録されている。
+そのため、このデータを解析するには前年と比較しながらの解析するか、
+あるいは過去平均（平年値）を知った上で解析する必要がある。
+さらに記録値として高・多・やや高・やや多・並・やや少・やや低・少・低が使われている。
+そのため、定量的な解析に向かない。
+
+定量的な統計解析に向くのが `value` だが、`value` 列には文字だったり（品種名、害虫名など）、数値だったり記録されている。定量解析に向く数値が記載されている記録を確認してみる。
+
+```{r check_valided_records_values}
+pdpdb_valid_numeric_values <- table(((!is.na(pdpdb$value)) & (pdpdb$unit != '文字')))
+pdpdb_valid_numeric_values / sum(pdpdb_valid_numeric_values)
+```
+
+
+定量的な統計解析に向くのが
+`value` 列に有効な値が記録されている `r pdpdb_valid_numeric_values[2]/sum(pdpdb_valid_numeric_values) * 100`%
+（`r pdpdb_valid_numeric_values[2]` 件）のデータである。
+このデータについてみていくことにする。
+
+
+## データ整理
+
+
+### 調査項目
+
+実際の定量データをみていく前に調査項目などを整理する。
+
+- 調査項目 `survey` が本圃ついている項目とついていない項目がある。実際の調査実施期間において、両者を区別していない場合が多い。そこで本解析では、本圃がついている調査とそうでない調査が同じ調査として、両者をマージしてから解析を進めることにする。
+- 同様に「本田」がついている調査項目とそうでない項目もある。これらについても、マージして同じものとして扱う。
+
+まず、本圃ありなしと本田ありなしのデータをマージする。
+
+```{r format_pdpdb_hompo}
+pdpdb <- pdpdb %>%
+    mutate(survey = str_replace_all(survey, '^(本圃|本田)', ''))
+```
+
+
+次に調査項目について着目していく。
+
+作物病害について、調査項目に「発病葉率」、「発病株率」、「発病果率」、「発病穂率」、「発病茎率」など /^発病.+率$/ の調査項目がある。
+
+- 例えば、そば・きく・茶などは発病葉率で記録されているが、発病株率で記録されていない。
+- 逆に、はくさい・ねぎ・れたすなどが発病株率で記録されているが、発病葉率で記録されていない。
+- また、とまと・なす・きゅうり・メロンなどは発病葉率と発病株率の両方で記録されている。
+- これらは作目の特徴に応じた調査となっている。例えば結実するかどうかなど。作物の生育ステージによって、「発病葉率」と「発病株率」と「発病穂率」が同時に記録されることもあれば、「発病葉率」→「発病穂率」への調査項目が変遷することもある。
+
+このことを考えると、被害程度を調べたり、あるいは将来予測に用いたりする際に、「発病葉率」、「発病株率」、「発病果率」、「発病穂率」、「発病茎率」など /^発病.+率$/ の調査項目をすべてなんらかの基準でまとめて扱った方がデータ量が多くなる。
+
+また、虫害については、病害の /^発病.+率$/ の記録に対して、 
+/^寄生.+率$/ で記録されている。虫害に関しても、「寄生葉率」、「寄生株率」などが存在する。これらも病害と同様になんらかの基準でまとめて扱った方がデータ量が多くなる。
+
+病害・虫害は植物のどの部位にも現れる。葉っぱを好みとするウィルス・害虫もあれば、茎を好むウィルス・害虫もある。よって、同じ年月・同じ都道府県・同じ作物に対して、「発病葉率」と「発病茎率」の両方が記録された場合、両者を単純に平均すると、作物、病害・虫害の発病割合をうまく捉えられないことがある。例えば、「発病葉率」が小さくても、「発病茎率」が高いと、やがて作物全体がダメになってしまう。
+
+このことを考えれば、平均を取るのではなく、同じ条件で複数の項目が調査されている場合、それらの中から最大値を扱った方が、発病の様子や後日の被害程度を正確に捉えることができる。
+
+/^発病.+率$/ の項目にはどのようなものがあるのかを一通りみてみる。
+
+```{r format_pdpdb_hatsubyo_1}
+survey_methods <- unique(pdpdb$survey)
+survey_methods_disease <- survey_methods[str_which(survey_methods, '発病.+率')]
+survey_methods_disease
+```
+
+これらの項目をみると、上のルール（複数調査項目がある場合、そのうち最大値を取る）に基づき、すべて同じ調査としてまとめてもよいと思われる。
+
+ここで、これらの調査項目をすべて「作物病害発病率」に置換して、これ以降同一のものとして扱うことにする。
+
+```{r format_pdpdb_hatsubyo_2}
+pdpdb <- pdpdb %>%
+    mutate(survey = str_replace(survey,
+                                paste0('^(', paste(survey_methods_disease, collapse='|'), ')$'),
+                                '作物病害発病率'))
+```
+
+害虫寄生率についても確認する。
+
+```{r format_pdpdb_kisei_1}
+survey_methods_pest <- survey_methods[str_which(survey_methods, '寄生.+率')]
+survey_methods_pest
+```
+
+
+これらについても、上のルールに基づきすべて同じ調査としてまとめてよさそう。これ以降、これらを「作物害虫寄生率」としてまとめて扱うことにする。
+
+
+```{r format_pdpdb_kisei_2}
+pdpdb <- pdpdb %>%
+    mutate(survey = str_replace(survey,
+                                paste0('^(', paste(survey_methods_pest, collapse='|'), ')$'),
+                                '作物害虫寄生率'))
+```
+
+
+同様に /^被害.+率$/ についても確認する。これは主に虫害による被害を記録したデータである。これ以降、これらを「作物虫害被害率」として扱う。
+
+
+```{r format_pdpdb_higai_1}
+survey_methods_damage <- survey_methods[str_which(survey_methods, '被害.+率')]
+survey_methods_damage
+```
+
+```{r format_pdpdb_higai_2}
+pdpdb <- pdpdb %>%
+    mutate(survey = str_replace(survey,
+                                paste0('^(', paste(survey_methods_damage, collapse='|'), ')$'),
+                                '作物虫害被害率'))
+```
+
+
+### 作目
+
+一部の作目に季節コードがついている。例えば、冬春ピーマン、夏秋ピーマン、冬春キュウリ、夏秋キュウリ、冬キャベツ、秋ニンジンのようなものがある。このままだと、例えば冬春キュウリと夏秋キュウリが別々に扱われる。そこで、これらの作目がデータ解析中に同じ作目として扱える様に春、夏、秋、冬という季節コードを削除する。
+
+
+
+```{r format_pdpdb_season}
+pdpdb <- pdpdb %>%
+    mutate(crop = str_replace_all(crop, '(春|夏|秋|冬)', ''))
+```
+
+
+## 定量データ概要
+
+
+
+集計用の関数を用意する。
+
+```{r summarizing_functions}
+# melt2array_by_invest
+# 
+# Convert data.frame to multi-dim array.
+# If `summarise_by_month` is TRUE, calculate the average of `value` for each year-month.
+melt2array_by_invest <- function(x, key = 'survey', val = NULL,
+                                 summarise_by_month = FALSE, summarise_fun = NULL) {
+    if (is.null(val)) {stop('`val` should not be NULL.')}
+    
+    y <- x %>%
+            dplyr::filter(get(key) == UQ(val)) %>%
+            dplyr::filter(!is.na(date)) %>%
+            dplyr::filter(unit != '文字') %>%
+            dplyr::mutate(value = as.numeric(value),
+                          date = as.character(date)) %>%
+            dplyr::filter(!is.na(value))
+    if (summarise_by_month) {
+        y <- y %>%
+            dplyr::mutate(date = paste0(str_sub(date, start = 1, end = 7), '-15')) %>%
+            dplyr::group_by(date, location, crop, item) %>%
+            dplyr::summarise(value = summarise_fun(value), .groups = 'drop') %>%
+            dplyr::ungroup()            
+    }
+    
+    d1 <- y %>% dplyr::distinct(crop) %>% unlist(use.names = FALSE)
+    d2 <- y %>% dplyr::distinct(item) %>% unlist(use.names = FALSE)
+    d3 <- y %>% dplyr::distinct(location) %>% unlist(use.names = FALSE)
+    d4 <- y %>% dplyr::distinct(date) %>% unlist(use.names = FALSE)
+    d1 <- sort(d1)
+    d2 <- sort(d2)
+    d3 <- sort(d3)
+    d4 <- sort(d4)
+    
+    z <- array(NA, dim = c(length(d1), length(d2), length(d3), length(d4)),
+               dimnames = list(d1, d2, d3, d4))
+    for (i in d1) {
+        for (j in d2) {
+            .z.mat <- array(NA, dim = c(length(d3), length(d4)), dimnames = list(d3, d4))
+            .y <- y %>% 
+                dplyr::filter(crop == UQ(i)) %>%
+                dplyr::filter(item == UQ(j))
+            if (nrow(.y) > 0) {
+                for (k in 1:nrow(.y)) {
+                    .z.mat[.y$location[k], .y$date[k]] <- .y$value[k]
+                }
+            }
+            z[i, j, , ] <- .z.mat
+        }
+    }
+    
+    z
+}
+
+# count_valid_records
+# 
+# Calculate number of valid (non NA) records for each survey.
+count_valid_records <- function(x) {
+    survey_methods <- x %>% dplyr::distinct(survey) %>% unlist(use.names = FALSE)
+    record_counts <- data.frame(survey = survey_methods,
+                                n_crops = NA,
+                                n_items = NA,
+                                n_prefectures = NA,
+                                n_dates = NA,
+                                date_from = NA,
+                                date_to = NA,
+                                n_records = NA)
+    for (i in seq(survey_methods)) {
+        y <- melt2array_by_invest(x, key = 'survey', val = survey_methods[i])
+        record_counts[i, 2:5] <- dim(y)
+        record_counts[i, 6] <- ifelse(dim(y)[4] > 0, head(dimnames(y)[[4]], 1), NA)
+        record_counts[i, 7] <- ifelse(dim(y)[4] > 0, tail(dimnames(y)[[4]], 1), NA)
+        record_counts[i, 8] <- sum(!is.na(y))
+    }
+    record_counts <- record_counts[order(record_counts$n_records, decreasing = TRUE), ]
+    rownames(record_counts) <- NULL
+    record_counts
+}
+
+# get_subarray
+#
+# Get subset of array with the given dimension.
+get_subarray <- function(x, dim_n, dim_idx) {
+    n <- length(dim(x))
+    idx <- ''
+    for (i in seq(n)) {
+        idx <- paste0(idx, ifelse(i == dim_n, dim_idx, ','))
+    }
+    eval(parse(text = paste('subx = x[', idx, ']')))
+    subx
+}
+```
+
+
+実際に集計してみる。
+
+
+```{r check_valided_records_for_each_survey}
+if (!exists('valid_records')) {
+    valid_records <- count_valid_records(pdpdb)
+    save(list = ls(), file = PDPDB_RDATA)
+}
+valid_records
+```
+
+
+
+定量データを眺めると、
+
+- 作物について、50 作物以上の作物について調査が行われている項目は `r sum(valid_records$n_crops >= 50)` 項ある。40 作物以上、30 作物以上、20 作物以上、10 作物以上がそれぞれ、`r sum(valid_records$n_crops >= 40)`, `r sum(valid_records$n_crops >= 30)`, `r sum(valid_records$n_crops >= 20)`, `r sum(valid_records$n_crops >= 10)` 項であった。
+- 病害項目について、ほとんどが 1 病害、2 病害である。5 病害以上調査が行われた項目について全体の `r round(table(valid_records$n_items >= 5) / nrow(valid_records) * 100, 2)[2]`% しかなく、10 病害以上調査が行われた項目については全体の `r round(table(valid_records$n_items >= 10) / nrow(valid_records) * 100, 2)[2]`% しかない。
+- 半分以上の都道府県で調査が行われた項目については、全体の `r round(table(valid_records$n_prefectures >= (47/2)) / nrow(valid_records) * 100, 2)[2]`% あった。
+
+
+調査回数の多い調査項目について、
+特定の作物、病害あるいは都道府県に集中してることはある。
+そのため、単純に `n_recods` の数で、その調査項目が将来予測に適しているかどうかを判断できない。
+そこで、
+
+- 調査項目（病害種類）が 10 よりも多く 
+- 作目数が 10 よりも多く
+- ほぼ全国規模（半分以上の都道府県）行われた
+
+の条件を同時に満たす調査項目を取得し、作目・病害・都道府県・調査年月あたりの調査回数を計算してみる。
+
+
+```{r check_rich_validated_records}
+valid_records_rich <- valid_records %>%
+    dplyr::filter(n_crops > 10) %>%
+    dplyr::filter(n_items > 10) %>%
+    dplyr::filter(n_prefectures >= 47 * 0.5) %>%
+    dplyr::mutate(n_records_norm = n_records / (as.double(n_crops) * n_items * n_prefectures * n_dates)) %>%
+    dplyr::arrange(dplyr::desc(n_records_norm))
+valid_records_rich
+```
+
+
+この結果を眺めてみると、データがかなりスパースだとわかる。
+例えば、「作物害虫寄生率」という調査項目をみると、
+調査回数が `r valid_records_rich$n_records[1]` となっているのだが、
+作目・病害・都道府県・調査年月あたりの調査回数が `r valid_records_rich$n_records_norm[1]` 回となっている。
+
+リストアップされた項目をみると、
+
+- 「作物害虫寄生率」: 調査した作目部位中に、実際に害虫が寄生している割合。
+- 「発病度」: 基準が曖昧で定量解析に向かない。
+- 「作物病害発病率」: 調査した作目部位中に、実際に病害が発生している割合。
+- 「発生面積」: 「{(調査圃場のうち病害虫害発生した圃場の面積)/(調査圃場)}*(対象作目の作付面積)」で計算される。しかし、作付面積が登録されていなく、この面積を各県ああるいは各項目で比較することができない。
+- 「作物虫害被害率」: 虫害による被害率を調査した割合。（「大豆べと病」と「くり実炭そ病」のみが混ざっている。）
+
+
+
+作物害虫寄生率、作物病害発病率、作物虫害被害率についてもう少し詳しくみてみる。
+作物害虫寄生率、作物病害発病率、作物虫害被害率について、「作目 X 調査項目（虫害種類） X 都道府県 X 年月」の総当たりの組み合わせでみたとき、non-NA の割合を計算する。
+
+まず、データの概要を計算する関数を用意する。
+
+```{r summarise_single_survey_functions}
+summarise_survey <- function(x, survey = NULL) {
+    if (is.null(survey)) { stop('`survey cannot be NULL.`') }
+    y <- melt2array_by_invest(pdpdb, key = 'survey', val = survey, summarise_by_month = FALSE)
+    .item <- .cate <- .naval <- .validval <- NULL
+    for (.i in seq(dim(y))) {
+        .dimnames <- dimnames(y)[[.i]]
+        .item <- c(.item, .dimnames)
+        for (.j in seq(.dimnames)) {
+            .cate <- c(.cate, switch(as.character(.i),
+                                     '1' = 'crop', '2' = 'item', '3' = 'location', '4' = 'date',
+                                     stop('unsupported index.')))
+            .y <- get_subarray(y, .i, .j)
+            .naval <- c(.naval, sum(is.na(.y)))
+            .validval <- c(.validval, sum(!is.na(.y)))
+        }
+    }
+    
+    data.frame(
+        category = .cate, item = .item, na_value = .naval, valid_value = .validval) %>%
+            dplyr::mutate(n_records = na_value + valid_value,
+                          valid_value_rate = valid_value / n_records) %>%
+        as_tibble()
+} 
+```
+
+
+実際に「作目 X 調査項目（虫害種類） X 都道府県 X 年月」の総当たりの組み合わせにおける、NA/non-NA の割合を計算する。なお、ここでの NA とは、該当条件で調査が行われていなく、データが not avaiable を意味する。
+
+
+```{r summarise_single_survey_calculation}
+if (!exists('pest_parasitism_stats')) {
+    pest_parasitism_stats <- summarise_survey(pdpdb, '作物害虫寄生率')
+    disease_damage_stats <- summarise_survey(pdpdb, '作物病害発病率')
+    pest_damage_stats <- summarise_survey(pdpdb, '作物虫害被害率')
+    save(list = ls(), file = PDPDB_RDATA)
+}
+```
+
+### 作物害虫寄生率
+
+```{r summarise_single_survey_pest_parasitism}
+pest_parasitism_stats %>% arrange(category, desc(valid_value_rate))
+fig_pest_parasitism_stats <- pest_parasitism_stats %>% 
+    ggplot(aes(x = valid_value_rate)) +
+    geom_histogram() +
+    facet_wrap(~ category, scales = 'free')
+print(fig_pest_parasitism_stats)
+```
+
+
+- 作目（crop）、調査項目（item; 害虫名）、調査日程（date）、都道府県（location）どれも non-NA の割合が 0% のところに集中している。一部のものだけ non-NA の割合が比較的に高めである。
+    - 例えば「かんきつ」の non-NA 割合は `r round(pest_parasitism_stats$valid_value_rate[pest_parasitism_stats$item == 'かんきつ'] * 100, 3)`% であり、「ホウレンソウ」の non-NA 割合は `r round(pest_parasitism_stats$valid_value_rate[pest_parasitism_stats$item == 'ホウレンソウ'] * 100, 6)`% である。
+    - つまり、かんきつについてよく調査されているが、ホウレンソウについてはあまり調査されていない。
+    - 栽培品種の変更や栽培期間の長さなどに起因すると思われる。
+
+このように調査件数の多い調査項目についてもかなりスパースである。
+
+
+
+### 作物病害発病率
+
+
+```{r summarise_single_survey_disease}
+disease_damage_stats %>% arrange(category, desc(valid_value_rate))
+fig_disease_damage_stats <- disease_damage_stats %>% 
+    ggplot(aes(x = valid_value_rate)) +
+    geom_histogram() +
+    facet_wrap(~ category, scales = 'free')
+print(fig_disease_damage_stats)
+```
+
+
+
+### 作物虫害被害率
+
+
+```{r summarise_single_survey_pest_damage}
+pest_damage_stats %>% arrange(category, desc(valid_value_rate))
+fig_pest_damage_stats <- pest_damage_stats %>% 
+    ggplot(aes(x = valid_value_rate)) +
+    geom_histogram() +
+    facet_wrap(~ category, scales = 'free')
+print(fig_pest_damage_stats)
+```
+
+
+
+
+
+# JPP-NET
+
+JPP-NETは、農林水産省から委託を受けて（社）日本植物防疫協会が47都道府県の病害虫発生予察事業の概要をとりまとめてWEBで公開しているシステム- http://web1.jppn.ne.jp/member/。 現在、日植防が有料でデータを公開しているが、農水省植物防疫課から農研機構内でのデータの使用許可をもらっている。論文引用の際には（社）日本植物防疫協会ではなくて、農水省消安局植防課に許可を得てここからデータをもらったことにすべし。
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+
