@@ -74,6 +74,7 @@ summarise_dataset <- function(x) {
 
 
 
+
 #' create_table_prefectures
 #'
 #' Create table to store prefecture JIS code and name.
@@ -191,6 +192,31 @@ main <- function(damage_records_dpath, mst_data_dpath, db_host) {
     RSQLite::dbDisconnect(con)
 
 }
+
+
+data_check <- function(x) {
+    X <- load_dataset(damage_records_dpath)
+    x <- dplyr::mutate(X, date = as.character(date)) |>
+        dplyr::mutate(date = paste0(str_sub(date, start = 1, end = 7), '-01')) |>
+        dplyr::group_by(date, prefecture, crop, damage) |>
+        dplyr::summarise(n = n(), max = max(value), mean = mean(value), min = min(value), .groups = 'drop')
+    
+    nrow(x[x$n > 1, ])
+    nrow(x[x$n > 1, ]) / nrow(x)
+    
+    d <- (x$max - x$mean)
+    d <- d[x$n > 1]
+    mean(d)
+    sd(d)
+    median(d)
+    
+    x <- dplyr::mutate(X, date = as.character(date)) |>
+        dplyr::mutate(date = as.integer(str_sub(date, start = 1, end = 4))) |>
+        dplyr::group_by(prefecture, crop, damage) |>
+        dplyr::summarise(max = max(date), min = min(date), diff = max(date) - min(date), .groups = 'drop')
+    
+}
+
 
 
 args = commandArgs(trailingOnly = TRUE)

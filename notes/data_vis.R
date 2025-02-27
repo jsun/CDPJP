@@ -308,7 +308,7 @@ DI |>
                   month = str_sub(date, 6, 7)) |>
     dplyr::select(combn_id, crop, damage, prefecture, yr, month) |>
     dplyr::group_by(combn_id) |>
-    dplyr::summarise(n_samples = n(), n_yr = n_distinct(yr), n_month = n_distinct(month)) |>
+    dplyr::summarise(n_samples = n(), n_yr = n_distinct(yr), n_month = n_distinct(month), yr_from = min(yr), yr_to = max(yr)) |>
     dplyr::mutate(
         crop = str_split(combn_id, '___', simplify = TRUE)[, 1],
         damage = str_split(combn_id, '___', simplify = TRUE)[, 2],
